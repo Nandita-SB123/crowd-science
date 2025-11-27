@@ -1,0 +1,491 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Circle
+
+# Simulation parameters
+N = 80                # number of people (dots)
+RADIUS = 0.12         # hitbox radius of each person
+ROOM_WIDTH = 10.0
+ROOM_HEIGHT = 6.0
+EXIT_WIDTH = 1.5
+DT = 0.1              # time step
+MAX_SPEED = 0.15
+
+# Exit 1: bottom wall, centred
+EXIT1_X_CENTER = ROOM_WIDTH / 2
+EXIT1_Y = 0.0
+EXIT1_X_MIN = EXIT1_X_CENTER - EXIT_WIDTH / 2
+EXIT1_X_MAX = EXIT1_X_CENTER + EXIT_WIDTH / 2
+
+# Exit 2: top wall, centred (other side of the room)
+EXIT2_X_CENTER = ROOM_WIDTH / 2
+EXIT2_Y = ROOM_HEIGHT
+EXIT2_X_MIN = EXIT2_X_CENTER - EXIT_WIDTH / 2
+EXIT2_X_MAX = EXIT2_X_CENTER + EXIT_WIDTH / 2
+
+# Target points slightly outside the room for each exit
+EXIT1_TARGET = np.array([EXIT1_X_CENTER, -1.0])
+EXIT2_TARGET = np.array([EXIT2_X_CENTER, ROOM_HEIGHT + 1.0])
+
+# Circular obstacle in the middle of the room
+OBSTACLE_CENTER = np.array([ROOM_WIDTH / 2, ROOM_HEIGHT / 2])
+OBSTACLE_RADIUS = 0.8
+
+# Weights for decision-making
+PROXIMITY_WEIGHT = 1.0
+HERDING_WEIGHT = 1.5
+HERDING_RADIUS = 1.5   # how close to an exit counts as "around it"
+
+# Global simulation state
+positions = None
+velocities = None
+active = None
+sim_time = 0.0           # simulation time
+mode = "herding"         # "herding" or "ideal"
+sim_running = False      # start paused so you can choose mode first
+
+
+def sample_initial_positions():
+    """Sample initial positions with higher density away from walls."""
+    positions = []
+    max_attempts = 5000
+    attempts = 0
+
+    # max possible distance to a wall (for acceptance probability)
+    max_dist_to_wall = min(ROOM_WIDTH, ROOM_HEIGHT) / 2
+
+    while len(positions) < N and attempts < max_attempts:
+        attempts += 1
+
+        # sample uniformly in the room with a small margin from walls
+        margin = RADIUS * 2
+        x = np.random.uniform(margin, ROOM_WIDTH - margin)
+        y = np.random.uniform(margin, ROOM_HEIGHT - margin)
+
+        pos = np.array([x, y])
+
+        # reject if inside obstacle
+        if np.linalg.norm(pos - OBSTACLE_CENTER) < OBSTACLE_RADIUS + RADIUS:
+            continue
+
+        # distance to closest wall
+        dist_to_wall = min(x, ROOM_WIDTH - x, y, ROOM_HEIGHT - y)
+
+        # accept with probability proportional to distance to wall
+        if np.random.uniform(0, max_dist_to_wall) > dist_to_wall:
+            continue
+
+        # avoid starting overlaps (simple check)
+        too_close = False
+        for p in positions:
+            if np.linalg.norm(pos - p) < 2 * RADIUS:
+                too_close = True
+                break
+        if too_close:
+            continue
+
+        positions.append(pos)
+
+    if len(positions) < N:
+        print("Warning: could not place all agents without overlap, placed", len(positions))
+
+    return np.array(positions)
+
+
+def create_velocities():
+    """Initial velocities are zero; they'll be driven by goal + repulsion."""
+    return np.zeros((N, 2))
+
+
+def compute_goal_direction(pos, target):
+    """Direction from pos to a given target point."""
+    direction = target - pos
+    norm = np.linalg.norm(direction)
+    if norm == 0:
+        return np.zeros(2)
+    return direction / norm
+
+
+def wall_repulsion(pos):
+    """Repulsion vector from walls to keep agents inside (except at exits)."""
+    force = np.zeros(2)
+    wall_thresh = 0.5
+
+    x, y = pos
+
+    # left wall (x=0)
+    if x < wall_thresh:
+        force[0] += (wall_thresh - x)
+    # right wall (x=ROOM_WIDTH)
+    if ROOM_WIDTH - x < wall_thresh:
+        force[0] -= (wall_thresh - (ROOM_WIDTH - x))
+    # bottom wall (y=0), excluding bottom exit interval
+    if y < wall_thresh:
+        if not (EXIT1_X_MIN <= x <= EXIT1_X_MAX):
+            force[1] += (wall_thresh - y)
+    # top wall (y=ROOM_HEIGHT), excluding top exit interval
+    if ROOM_HEIGHT - y < wall_thresh:
+        if not (EXIT2_X_MIN <= x <= EXIT2_X_MAX):
+            force[1] -= (wall_thresh - (ROOM_HEIGHT - y))
+
+    return force
+
+
+def obstacle_repulsion(pos):
+    """Repulsion from the central obstacle."""
+    vec = pos - OBSTACLE_CENTER
+    dist = np.linalg.norm(vec)
+    thresh = OBSTACLE_RADIUS + 0.8
+    if dist < 1e-6 or dist > thresh:
+        return np.zeros(2)
+    # repel more strongly the closer you are
+    strength = (thresh - dist)
+    return (vec / dist) * strength
+
+
+def agent_repulsion(positions):
+    """Pairwise repulsion to avoid overlaps."""
+    rep = np.zeros_like(positions)
+    neighbor_radius = 2.5 * RADIUS
+
+    for i in range(N):
+        if not active[i]:
+            continue
+        for j in range(i + 1, N):
+            if not active[j]:
+                continue
+            diff = positions[i] - positions[j]
+            dist = np.linalg.norm(diff)
+            if dist < 1e-6 or dist > neighbor_radius:
+                continue
+            # repel each other
+            overlap = neighbor_radius - dist
+            dir_vec = diff / dist
+            rep[i] += dir_vec * overlap
+            rep[j] -= dir_vec * overlap  # equal and opposite
+
+    return rep
+
+
+def enforce_no_overlap(positions):
+    """Simple relaxation to push overlapping agents apart."""
+    for _ in range(2):  # a couple of passes
+        for i in range(N):
+            if not active[i]:
+                continue
+            for j in range(i + 1, N):
+                if not active[j]:
+                    continue
+                diff = positions[i] - positions[j]
+                dist = np.linalg.norm(diff)
+                min_dist = 2 * RADIUS
+                if dist < 1e-6 or dist >= min_dist:
+                    continue
+                # push them apart equally
+                move = (min_dist - dist) / 2
+                dir_vec = diff / dist
+                positions[i] += dir_vec * move
+                positions[j] -= dir_vec * move
+
+
+def choose_exit_targets_herding():
+    """
+    For each active agent, decide which exit they are heading toward
+    based on proximity and herding scores.
+    Returns an array of target points of shape (N, 2).
+    """
+    targets = np.zeros_like(positions)
+
+    # Distances to each exit centre (on the wall)
+    exit1_center = np.array([EXIT1_X_CENTER, EXIT1_Y])
+    exit2_center = np.array([EXIT2_X_CENTER, EXIT2_Y])
+
+    pos_active = positions[active]
+
+    dists1 = np.linalg.norm(pos_active - exit1_center, axis=1)
+    dists2 = np.linalg.norm(pos_active - exit2_center, axis=1)
+
+    # Herding: how many agents are "around" each exit
+    near_exit1 = dists1 < HERDING_RADIUS
+    near_exit2 = dists2 < HERDING_RADIUS
+
+    count1 = near_exit1.sum()
+    count2 = near_exit2.sum()
+
+    # Normalised herding factor (0..1-ish)
+    total_active = max(1, active.sum())
+    herd_factor1 = count1 / total_active
+    herd_factor2 = count2 / total_active
+
+    # We'll fill targets one by one
+    eps = 0.3  # to avoid division by zero in proximity term
+
+    idx_active = np.where(active)[0]
+    for idx_pos, i in enumerate(idx_active):
+        d1 = dists1[idx_pos]
+        d2 = dists2[idx_pos]
+
+        # Proximity scores: closer => larger 1/d
+        prox1 = 1.0 / (d1 + eps)
+        prox2 = 1.0 / (d2 + eps)
+
+        score1 = PROXIMITY_WEIGHT * prox1 + HERDING_WEIGHT * herd_factor1
+        score2 = PROXIMITY_WEIGHT * prox2 + HERDING_WEIGHT * herd_factor2
+
+        # Choose exit with higher score
+        if score2 > score1:
+            targets[i] = EXIT2_TARGET
+        else:
+            targets[i] = EXIT1_TARGET
+
+    return targets
+
+
+def choose_exit_targets_ideal():
+    """
+    Idealised behaviour: each agent simply heads to the geometrically
+    closest exit (no herding).
+    """
+    targets = np.zeros_like(positions)
+
+    exit1_center = np.array([EXIT1_X_CENTER, EXIT1_Y])
+    exit2_center = np.array([EXIT2_X_CENTER, EXIT2_Y])
+
+    idx_active = np.where(active)[0]
+    for i in idx_active:
+        d1 = np.linalg.norm(positions[i] - exit1_center)
+        d2 = np.linalg.norm(positions[i] - exit2_center)
+        if d1 <= d2:
+            targets[i] = EXIT1_TARGET
+        else:
+            targets[i] = EXIT2_TARGET
+
+    return targets
+
+
+def step():
+    """Advance the simulation by one time step."""
+    global positions, velocities, active, sim_time, mode, sim_running
+
+    goal_weight = 1.5
+    wall_weight = 2.0
+    obstacle_weight = 2.5
+    repulsion_weight = 4.0
+
+    reps = agent_repulsion(positions)
+
+    if mode == "ideal":
+        targets = choose_exit_targets_ideal()
+    else:
+        targets = choose_exit_targets_herding()
+
+    for i in range(N):
+        if not active[i]:
+            continue
+
+        pos = positions[i]
+
+        # If agent already outside the room, mark inactive
+        if pos[1] < -0.5 or pos[1] > ROOM_HEIGHT + 0.5:
+            active[i] = False
+            continue
+
+        # compute forces
+        g = compute_goal_direction(pos, targets[i]) * goal_weight
+        w = wall_repulsion(pos) * wall_weight
+        o = obstacle_repulsion(pos) * obstacle_weight
+        a = reps[i] * repulsion_weight
+
+        total = g + w + o + a
+
+        norm = np.linalg.norm(total)
+        if norm > 0:
+            velocities[i] = (total / norm) * MAX_SPEED
+        else:
+            velocities[i] = np.zeros(2)
+
+    # propose new positions
+    new_positions = positions + velocities * DT
+
+    # keep inside walls (except exits)
+    for i in range(N):
+        if not active[i]:
+            continue
+        x, y = new_positions[i]
+
+        # left/right walls
+        if x < RADIUS:
+            x = RADIUS
+        if x > ROOM_WIDTH - RADIUS:
+            x = ROOM_WIDTH - RADIUS
+
+        # bottom wall with exit 1
+        if y < RADIUS:
+            if EXIT1_X_MIN <= x <= EXIT1_X_MAX:
+                # allow to go out through the exit
+                y = -1.0
+            else:
+                y = RADIUS
+
+        # top wall with exit 2
+        if y > ROOM_HEIGHT - RADIUS:
+            if EXIT2_X_MIN <= x <= EXIT2_X_MAX:
+                # allow to go out through the exit
+                y = ROOM_HEIGHT + 1.0
+            else:
+                y = ROOM_HEIGHT - RADIUS
+
+        new_positions[i] = [x, y]
+
+        # obstacle collision: if inside obstacle, push out
+        vec = new_positions[i] - OBSTACLE_CENTER
+        dist = np.linalg.norm(vec)
+        min_dist = OBSTACLE_RADIUS + RADIUS
+        if dist < min_dist and dist > 1e-6:
+            new_positions[i] = OBSTACLE_CENTER + vec / dist * min_dist
+
+    positions[:] = new_positions
+    enforce_no_overlap(positions)
+
+    # advance simulation time
+    sim_time += DT
+
+    # If everyone has evacuated, stop simulation (freeze timer)
+    if active.sum() == 0:
+        sim_running = False
+
+
+# --- Initialization of state ---
+positions = sample_initial_positions()
+velocities = create_velocities()
+active = np.ones(N, dtype=bool)
+
+# --- Visualization setup ---
+
+fig, ax = plt.subplots()
+ax.set_xlim(0, ROOM_WIDTH)
+ax.set_ylim(0, ROOM_HEIGHT)
+ax.set_aspect('equal')
+ax.set_title("Crowd moving toward two exits")
+
+# draw room walls (as lines, leaving gaps for the exits)
+
+# Left and right walls
+ax.plot([0, 0], [0, ROOM_HEIGHT], 'k-', linewidth=2)                    # left
+ax.plot([ROOM_WIDTH, ROOM_WIDTH], [0, ROOM_HEIGHT], 'k-', linewidth=2)  # right
+
+# Bottom wall with gap at exit 1
+ax.plot([0, EXIT1_X_MIN], [0, 0], 'k-', linewidth=2)
+ax.plot([EXIT1_X_MAX, ROOM_WIDTH], [0, 0], 'k-', linewidth=2)
+ax.plot([EXIT1_X_MIN, EXIT1_X_MAX], [0, 0], 'g-', linewidth=4)         # exit 1 (green)
+
+# Top wall with gap at exit 2
+ax.plot([0, EXIT2_X_MIN], [ROOM_HEIGHT, ROOM_HEIGHT], 'k-', linewidth=2)
+ax.plot([EXIT2_X_MAX, ROOM_WIDTH], [ROOM_HEIGHT, ROOM_HEIGHT], 'k-', linewidth=2)
+ax.plot([EXIT2_X_MIN, EXIT2_X_MAX], [ROOM_HEIGHT, ROOM_HEIGHT], 'g-', linewidth=4)  # exit 2 (green)
+
+# draw the central obstacle
+obstacle_patch = Circle(OBSTACLE_CENTER, OBSTACLE_RADIUS, color='gray', alpha=0.5)
+ax.add_patch(obstacle_patch)
+
+# --- People visuals: outer hitbox + inner dot ---
+
+# Size scaling for visualization (tweak if you want)
+outer_size = (RADIUS * 300) ** 2   # area in points^2
+inner_size = outer_size * 0.2      # smaller inner dot
+
+# Outer scatter: hitbox perimeter (hollow circles)
+outer_scat = ax.scatter(
+    positions[:, 0], positions[:, 1],
+    s=outer_size,
+    facecolors='none',
+    edgecolors='black',
+    linewidths=1.5
+)
+
+# Inner scatter: smaller solid black dots
+inner_scat = ax.scatter(
+    positions[:, 0], positions[:, 1],
+    s=inner_size,
+    c='black'
+)
+
+# Timer and mode text in the corner
+timer_text = ax.text(
+    0.02, 0.98, '',
+    transform=ax.transAxes,
+    va='top', ha='left'
+)
+mode_text = ax.text(
+    0.98, 0.98, '',
+    transform=ax.transAxes,
+    va='top', ha='right'
+)
+hint_text = ax.text(
+    0.02, 0.90,
+    "Press 'p' to start/pause\nPress 't' to toggle mode",
+    transform=ax.transAxes,
+    va='top', ha='left',
+    fontsize=8
+)
+
+
+def init_anim():
+    active_pos = positions[active]
+    outer_scat.set_offsets(active_pos)
+    inner_scat.set_offsets(active_pos)
+    timer_text.set_text(f"t = {sim_time:.1f} s")
+    mode_text.set_text(f"Mode: {mode}")
+    return outer_scat, inner_scat, timer_text, mode_text, hint_text
+
+
+def update_anim(frame):
+    global sim_running
+
+    # Only advance simulation if running and someone is still inside
+    if sim_running and active.any():
+        step()
+
+    shown_positions = positions[active]
+    if shown_positions.size == 0:
+        # No active agents left; keep last frame but update texts
+        timer_text.set_text(f"t = {sim_time:.1f} s")
+        mode_text.set_text(f"Mode: {mode}")
+        return outer_scat, inner_scat, timer_text, mode_text, hint_text
+
+    outer_scat.set_offsets(shown_positions)
+    inner_scat.set_offsets(shown_positions)
+    timer_text.set_text(f"t = {sim_time:.1f} s")
+    mode_text.set_text(f"Mode: {mode}")
+    return outer_scat, inner_scat, timer_text, mode_text, hint_text
+
+
+def on_key_press(event):
+    global mode, sim_running
+    if event.key == 't':
+        # toggle between herding and ideal
+        mode = "ideal" if mode == "herding" else "herding"
+        mode_text.set_text(f"Mode: {mode}")
+        fig.canvas.draw_idle()
+    elif event.key == 'p':
+        # start/pause the simulation
+        # if everyone is gone, don't restart; just ignore
+        if active.any():
+            sim_running = not sim_running
+        fig.canvas.draw_idle()
+
+
+fig.canvas.mpl_connect('key_press_event', on_key_press)
+
+anim = FuncAnimation(
+    fig,
+    update_anim,
+    init_func=init_anim,
+    frames=500,
+    interval=50,
+    blit=False
+)
+
+plt.tight_layout()
+plt.show()
