@@ -10,9 +10,16 @@ SIM_SPEED = 1.0
 NEIGHBOR_DIST = 3.5
 SEPARATION_FORCE = 0.8
 TARGET_FORCE = 0.25
-MAX_SPEED = 2.0
+# MAX_SPEED removed here, defined per-agent type below
 FRICTION = 0.95
-SPAWN_RATE = 5 
+SPAWN_RATE = 5
+
+# --- AGENT TYPES CONFIG ---
+CHILD_RATIO = 0.25   # 25% of agents will be children
+ADULT_SPEED = 2.0    # Max speed for adults
+CHILD_SPEED = 1.4    # Max speed for children (slower)
+ADULT_SIZE = 50      # Scatter plot marker size
+CHILD_SIZE = 20      # Smaller marker size
 
 # Harrods 4th Floor Boundary (Approximated from Image)
 FLOOR_BOUNDARY = [
@@ -20,7 +27,7 @@ FLOOR_BOUNDARY = [
     (90, 10),   # Bottom right (Brompton Rd / Hans Cres corner)
     (90, 95),   # Top right (Brompton Rd / Hans Rd corner)
     (35, 90),   # Top Left Peak (Hans Rd slant)
-    (5, 65),   # Top Left Cut (Basil St start)
+    (5, 65),    # Top Left Cut (Basil St start)
     (10, 10)    # Close loop
 ]
 
@@ -68,6 +75,11 @@ class CrowdSimulation:
         self.num_agents = 0
         self.pos = np.zeros((self.max_agents, 2))
         self.vel = np.zeros((self.max_agents, 2))
+        
+        # New arrays for agent types and varying speeds
+        self.agent_types = np.zeros(self.max_agents, dtype=int) # 0=Adult, 1=Child
+        self.max_speeds = np.zeros(self.max_agents)
+        
         self.target_zone = np.zeros(self.max_agents, dtype=int)
         self.reached_safety = np.zeros(self.max_agents, dtype=bool)
         self.zone_counts = np.zeros(len(SAFE_ZONES), dtype=int)  # Track zone occupancy
@@ -78,8 +90,8 @@ class CrowdSimulation:
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.setup_environment()
         
-        # Agents scatter plot
-        self.scat = self.ax.scatter([], [], c='blue', s=40, alpha=0.7, edgecolors='navy', linewidth=0.5)
+        # Agents scatter plot - Initialize with empty sizes list
+        self.scat = self.ax.scatter([], [], c='blue', s=[], alpha=0.7, edgecolors='navy', linewidth=0.5)
         self.title = self.ax.set_title("Harrods Floor 4 - Normal Operations", fontsize=14, fontweight='bold')
         self.info_text = self.ax.text(12, 92, "", fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
 
@@ -123,13 +135,8 @@ class CrowdSimulation:
         # Department Labels (Context)
         self.ax.text(32, 27, "Women's\nContemporary\n(High Traffic)", fontsize=8, color='#d14a6b', ha='center', alpha=0.6)
 
-    def is_inside_boundary(self, pos):
-        """Check if position is inside floor boundary with margin"""
-        return self.floor_path.contains_points(pos)
-
     def get_nearest_valid_position(self, pos):
         """Move position inside boundary if it's outside"""
-        # Simple approach: push toward center if outside
         center = np.array([50, 50])
         direction = center - pos
         test_pos = pos.copy()
@@ -156,7 +163,7 @@ class CrowdSimulation:
             distances.append(dist)
         
         distances = np.array(distances)
-        norm_distances = distances / np.max(distances)  # Normalize
+        norm_distances = distances / (np.max(distances) + 0.01)  # Normalize + avoid div zero
         
         # Combined score: 70% utilization, 30% distance
         scores = 0.7 * utilization + 0.3 * norm_distances
@@ -180,9 +187,21 @@ class CrowdSimulation:
         
         self.pos[self.num_agents] = new_pos
         
+        # --- DETERMINE AGENT TYPE ---
         angle = entrance['angle'] + np.random.randn() * 0.3
-        speed = np.random.uniform(0.5, 1.5)
-        self.vel[self.num_agents] = [np.cos(angle) * speed, np.sin(angle) * speed]
+        
+        if np.random.random() < CHILD_RATIO:
+            # It's a child
+            self.agent_types[self.num_agents] = 1
+            self.max_speeds[self.num_agents] = CHILD_SPEED
+            init_speed = np.random.uniform(0.4, 1.0) # Slower start
+        else:
+            # It's an adult
+            self.agent_types[self.num_agents] = 0
+            self.max_speeds[self.num_agents] = ADULT_SPEED
+            init_speed = np.random.uniform(0.7, 1.5) # Faster start
+
+        self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
         
         # Will assign zone during invacuation
         self.target_zone[self.num_agents] = 0
@@ -252,12 +271,12 @@ class CrowdSimulation:
         self.frame = frame
         
         # Phase 1: Shopping (Spawn people)
-        if frame < 200 and frame % 2 == 0:
+        if frame < 350 and frame % 2 == 0:
             entrance_idx = np.random.randint(0, len(ENTRANCES))
             self.spawn_person(entrance_idx)
         
         # Phase 2: Trigger Invacuation
-        if frame == 200:
+        if frame == 350:
             self.invacuating = True
             self.title.set_text("⚠️ INVACUATION PROTOCOL ACTIVATED ⚠️")
             self.title.set_color('red')
@@ -273,10 +292,14 @@ class CrowdSimulation:
         self.vel[:self.num_agents] += forces
         self.vel[:self.num_agents] *= FRICTION
         
-        # Speed Cap
-        speeds = np.linalg.norm(self.vel[:self.num_agents], axis=1, keepdims=True)
-        mask = speeds.flatten() > MAX_SPEED
-        self.vel[:self.num_agents][mask] = self.vel[:self.num_agents][mask] / speeds[mask] * MAX_SPEED
+        # --- INDIVIDUAL SPEED CAPS ---
+        # Loop approach for clarity and safety with differing limits
+        for i in range(self.num_agents):
+            speed = np.linalg.norm(self.vel[i])
+            if speed > self.max_speeds[i] and speed > 0:
+                 # Normalize velocity vector and multiply by agent's specific max speed
+                 self.vel[i] = (self.vel[i] / speed) * self.max_speeds[i]
+
         
         # Position Update
         new_pos = self.pos[:self.num_agents] + self.vel[:self.num_agents] * SIM_SPEED
@@ -284,7 +307,6 @@ class CrowdSimulation:
         # Wall Collision - Better handling
         in_bounds = self.floor_path.contains_points(new_pos)
         
-        # For out-of-bounds agents, keep old position and reverse velocity
         for i in range(self.num_agents):
             if in_bounds[i]:
                 self.pos[i] = new_pos[i]
@@ -293,12 +315,21 @@ class CrowdSimulation:
                 self.vel[i] *= -0.5
                 # Also try to nudge toward center
                 center = np.array([50, 50])
-                toward_center = (center - self.pos[i]) / np.linalg.norm(center - self.pos[i])
+                toward_center = (center - self.pos[i]) / np.linalg.norm(center - self.pos[i] + 0.01)
                 self.vel[i] += toward_center * 0.2
         
         # Visualization Update
         colors = []
+        sizes = [] # List to hold sizes for this frame
+
         for i in range(self.num_agents):
+            # --- DETERMINE SIZE based on type ---
+            if self.agent_types[i] == 1: # Child
+                sizes.append(CHILD_SIZE)
+            else: # Adult
+                sizes.append(ADULT_SIZE)
+
+            # Determine color based on state
             if self.reached_safety[i]:
                 colors.append('#32CD32')
             elif self.invacuating:
@@ -308,6 +339,7 @@ class CrowdSimulation:
                 
         self.scat.set_offsets(self.pos[:self.num_agents])
         self.scat.set_color(colors)
+        self.scat.set_sizes(sizes) # Apply the sizes
         
         safe_count = np.sum(self.reached_safety[:self.num_agents])
         
@@ -315,15 +347,15 @@ class CrowdSimulation:
         zone_info = "\n".join([f"{z['name']}: {self.zone_counts[i]}/{z['capacity']}" 
                                for i, z in enumerate(SAFE_ZONES)])
         
-        self.info_text.set_text(f"Shoppers: {self.num_agents}\nIn Safe Zones: {safe_count}\n"
-                            #    f"Status: {'INVACUATING' if self.invacuating else 'SHOPPING'}\n\n{zone_info}"
+        self.info_text.set_text(f"Agents: {self.num_agents}\n(Adults/Children mix)\nIn Safe Zones: {safe_count}\n"
+                                # f"Status: {'INVACUATING' if self.invacuating else 'SHOPPING'}\n\n{zone_info}"
                                )
         
         return self.scat, self.title, self.info_text
 
     def animate(self):
         anim = animation.FuncAnimation(self.fig, self.update, frames=400, 
-                                     interval=30, blit=False, repeat=False)
+                                       interval=30, blit=False, repeat=False)
         plt.tight_layout()
         plt.show()
 
