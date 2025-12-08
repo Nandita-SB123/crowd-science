@@ -9,7 +9,7 @@ NUM_PEOPLE = 350
 SIM_SPEED = 1.0
 NEIGHBOR_DIST = 3.5
 SEPARATION_FORCE = 0.8
-TARGET_FORCE = 0.20  # Increased slightly to help them find zones
+TARGET_FORCE = 0.25
 MAX_SPEED = 2.0
 FRICTION = 0.95
 SPAWN_RATE = 5 
@@ -27,23 +27,22 @@ FLOOR_BOUNDARY = [
 # Safe Zones (Invacuation areas based on low density/enclosed spaces in map)
 SAFE_ZONES = [
     # The Wellness Clinic (Top Center/Left - Purple)
-    {'x': 30, 'y': 45, 'w': 25, 'h': 25, 'name': 'Wellness Clinic', 'color': '#dcd0ff'},
+    {'x': 30, 'y': 45, 'w': 25, 'h': 25, 'name': 'Wellness Clinic', 'color': '#dcd0ff', 'capacity': 60},
     
     # Gordon Ramsay Burger Bar (Left Edge - Green)
-    {'x': 8, 'y': 41, 'w': 12, 'h': 17, 'name': 'Burger Bar', 'color': '#d0ffdc'},
+    {'x': 8, 'y': 41, 'w': 12, 'h': 17, 'name': 'Burger Bar', 'color': '#d0ffdc', 'capacity': 35},
    
     # Somewhere cafe
-    {'x': 30, 'y': 70, 'w': 10, 'h': 10, 'name': 'Somewhere Cafe', 'color': "#c4ffe3"},
+    {'x': 30, 'y': 70, 'w': 10, 'h': 10, 'name': 'Somewhere Cafe', 'color': "#c4ffe3", 'capacity': 20},
     
     # Georgian Restaurant
-    {'x': 40, 'y': 70, 'w': 25, 'h': 20, 'name': 'Georgian Restaurant', 'color': "#c4ffe3"},
+    {'x': 40, 'y': 70, 'w': 25, 'h': 20, 'name': 'Georgian Restaurant', 'color': "#c4ffe3", 'capacity': 80},
     
     # Childrenswear (Right Center - Orange/Peach)
-    {'x': 65, 'y': 30, 'w': 23, 'h': 50, 'name': 'Childrenswear', 'color': '#ffe4c4'},
+    {'x': 65, 'y': 30, 'w': 23, 'h': 50, 'name': 'Childrenswear', 'color': '#ffe4c4', 'capacity': 100},
     
     # Toy Kingdom (Bottom Right - Cyan)
-    {'x': 50, 'y': 12, 'w': 38, 'h': 15, 'name': 'Toy Kingdom', 'color': '#c4f4ff'}
-    
+    {'x': 50, 'y': 12, 'w': 38, 'h': 15, 'name': 'Toy Kingdom', 'color': '#c4f4ff', 'capacity': 80}
 ]
 
 # Entrances (Based on Lift/Escalator icons in map)
@@ -57,7 +56,7 @@ ENTRANCES = [
 # High Density Shopping Areas (To avoid during invacuation)
 HIGH_DENSITY_ZONES = [
     # Women's Contemporary & Sport (Bottom Left - Pink)
-    {'x': 15, 'y': 15, 'w': 35, 'h': 25}, 
+    {'x': 15, 'y': 25, 'w': 35, 'h': 25}, 
     
     # Mini Superbrands (Center Right - Beige)
     {'x': 65, 'y': 35, 'w': 15, 'h': 15}  
@@ -66,12 +65,12 @@ HIGH_DENSITY_ZONES = [
 class CrowdSimulation:
     def __init__(self):
         self.max_agents = NUM_PEOPLE
-        # Start with fewer people, spawn them gradually
         self.num_agents = 0
         self.pos = np.zeros((self.max_agents, 2))
         self.vel = np.zeros((self.max_agents, 2))
-        self.target_zone = np.zeros(self.max_agents, dtype=int)  # Which safe zone each person targets
+        self.target_zone = np.zeros(self.max_agents, dtype=int)
         self.reached_safety = np.zeros(self.max_agents, dtype=bool)
+        self.zone_counts = np.zeros(len(SAFE_ZONES), dtype=int)  # Track zone occupancy
         self.spawn_counter = 0
         self.invacuating = False
         
@@ -124,20 +123,69 @@ class CrowdSimulation:
         # Department Labels (Context)
         self.ax.text(32, 27, "Women's\nContemporary\n(High Traffic)", fontsize=8, color='#d14a6b', ha='center', alpha=0.6)
 
+    def is_inside_boundary(self, pos):
+        """Check if position is inside floor boundary with margin"""
+        return self.floor_path.contains_points(pos)
+
+    def get_nearest_valid_position(self, pos):
+        """Move position inside boundary if it's outside"""
+        # Simple approach: push toward center if outside
+        center = np.array([50, 50])
+        direction = center - pos
+        test_pos = pos.copy()
+        step_size = 0.5
+        
+        for _ in range(20):  # Max iterations
+            if self.floor_path.contains_point(test_pos):
+                return test_pos
+            test_pos += direction / np.linalg.norm(direction) * step_size
+        
+        return center  # Fallback to center
+
+    def assign_zone_balanced(self, person_idx):
+        """Assign person to least crowded zone based on capacity"""
+        # Calculate utilization ratio for each zone
+        utilization = self.zone_counts / np.array([z['capacity'] for z in SAFE_ZONES])
+        
+        # Add distance factor - prefer closer zones but prioritize balance
+        person_pos = self.pos[person_idx]
+        distances = []
+        for zone in SAFE_ZONES:
+            zone_center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
+            dist = np.linalg.norm(person_pos - zone_center)
+            distances.append(dist)
+        
+        distances = np.array(distances)
+        norm_distances = distances / np.max(distances)  # Normalize
+        
+        # Combined score: 70% utilization, 30% distance
+        scores = 0.7 * utilization + 0.3 * norm_distances
+        
+        # Choose zone with lowest score
+        chosen_zone = np.argmin(scores)
+        self.zone_counts[chosen_zone] += 1
+        return chosen_zone
+
     def spawn_person(self, entrance_idx):
         if self.num_agents >= self.max_agents:
             return
         
         entrance = ENTRANCES[entrance_idx]
-        offset = np.random.randn(2) * 1.5
-        self.pos[self.num_agents] = entrance['pos'] + offset
+        offset = np.random.randn(2) * 1.0  # Reduced spread
+        new_pos = entrance['pos'] + offset
+        
+        # Ensure spawn position is valid
+        if not self.floor_path.contains_point(new_pos):
+            new_pos = self.get_nearest_valid_position(new_pos)
+        
+        self.pos[self.num_agents] = new_pos
         
         angle = entrance['angle'] + np.random.randn() * 0.3
         speed = np.random.uniform(0.5, 1.5)
         self.vel[self.num_agents] = [np.cos(angle) * speed, np.sin(angle) * speed]
         
-        # Assign closest or random target zone? Random for now, but weighted could be better
-        self.target_zone[self.num_agents] = np.random.randint(0, len(SAFE_ZONES))
+        # Will assign zone during invacuation
+        self.target_zone[self.num_agents] = 0
         
         self.num_agents += 1
 
@@ -156,7 +204,6 @@ class CrowdSimulation:
             mask = (dist < NEIGHBOR_DIST) & (dist > 0.1)
             
             if np.any(mask):
-                # Inverse square law for separation
                 weights = 1.0 / (dist[mask]**2 + 0.1)
                 push = diff[mask] / dist[mask, None]
                 forces[i] -= np.sum(push * weights[:, None], axis=0) * SEPARATION_FORCE
@@ -173,8 +220,7 @@ class CrowdSimulation:
                 dist = np.linalg.norm(direction)
                 
                 if dist > 1.0:
-                    # Add urgency that increases over time
-                    urgency = 1.0 + (self.frame - 100) * 0.005
+                    urgency = 1.0 + (self.frame - 200) * 0.005
                     forces[i] += (direction / dist) * TARGET_FORCE * urgency
                 
                 # Check containment in zone
@@ -183,21 +229,18 @@ class CrowdSimulation:
                     self.pos[i, 1] > zone['y'] and 
                     self.pos[i, 1] < zone['y'] + zone['h']):
                     self.reached_safety[i] = True
-                    self.vel[i] *= 0.05 # CHECK THIS!
+                    self.vel[i] *= 0.05
         
         # 3. Avoid High Density Zones (Invacuation only)
         if self.invacuating:
             for i in range(self.num_agents):
                 if self.reached_safety[i]: continue
                 for zone in HIGH_DENSITY_ZONES:
-                    # # Simple bounding box avoidance
-                    # if (zone['x'] - 2 < self.pos[i,0] < zone['x'] + zone['w'] + 2 and
-                    #     zone['y'] - 2 < self.pos[i,1] < zone['y'] + zone['h'] + 2):
-                    #     # Push away from center of density zone
-                        center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
-                        diff = self.pos[i] - center
-                        dist = np.linalg.norm(diff)
-                        forces[i] += (diff / (dist + 0.1)) * 0.1
+                    center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
+                    diff = self.pos[i] - center
+                    dist = np.linalg.norm(diff)
+                    if dist < 20:  # Within influence range
+                        forces[i] += (diff / (dist + 0.1)) * 0.15
 
         # 4. Random Walking (Normal Ops)
         if not self.invacuating:
@@ -218,6 +261,9 @@ class CrowdSimulation:
             self.invacuating = True
             self.title.set_text("⚠️ INVACUATION PROTOCOL ACTIVATED ⚠️")
             self.title.set_color('red')
+            # Assign zones to all people using balanced algorithm
+            for i in range(self.num_agents):
+                self.target_zone[i] = self.assign_zone_balanced(i)
         
         if self.num_agents == 0:
             return self.scat, self.title, self.info_text
@@ -235,26 +281,43 @@ class CrowdSimulation:
         # Position Update
         new_pos = self.pos[:self.num_agents] + self.vel[:self.num_agents] * SIM_SPEED
         
-        # Wall Collision
+        # Wall Collision - Better handling
         in_bounds = self.floor_path.contains_points(new_pos)
-        self.pos[:self.num_agents] = np.where(in_bounds[:, None], new_pos, self.pos[:self.num_agents])
-        self.vel[:self.num_agents][~in_bounds] *= -0.5 # Bounce off walls
+        
+        # For out-of-bounds agents, keep old position and reverse velocity
+        for i in range(self.num_agents):
+            if in_bounds[i]:
+                self.pos[i] = new_pos[i]
+            else:
+                # Stay at old position and bounce
+                self.vel[i] *= -0.5
+                # Also try to nudge toward center
+                center = np.array([50, 50])
+                toward_center = (center - self.pos[i]) / np.linalg.norm(center - self.pos[i])
+                self.vel[i] += toward_center * 0.2
         
         # Visualization Update
         colors = []
         for i in range(self.num_agents):
             if self.reached_safety[i]:
-                colors.append('#32CD32') # Lime Green for safe
+                colors.append('#32CD32')
             elif self.invacuating:
-                colors.append('#FF4500') # Orange Red for panic
+                colors.append('#FF4500')
             else:
-                colors.append('#1E90FF') # Dodger Blue for shoppers
+                colors.append('#1E90FF')
                 
         self.scat.set_offsets(self.pos[:self.num_agents])
         self.scat.set_color(colors)
         
         safe_count = np.sum(self.reached_safety[:self.num_agents])
-        self.info_text.set_text(f"Shoppers: {self.num_agents}\nIn Safe Zones: {safe_count}\nStatus: {'INVACUATING' if self.invacuating else 'SHOPPING'}")
+        
+        # Show zone distribution
+        zone_info = "\n".join([f"{z['name']}: {self.zone_counts[i]}/{z['capacity']}" 
+                               for i, z in enumerate(SAFE_ZONES)])
+        
+        self.info_text.set_text(f"Shoppers: {self.num_agents}\nIn Safe Zones: {safe_count}\n"
+                            #    f"Status: {'INVACUATING' if self.invacuating else 'SHOPPING'}\n\n{zone_info}"
+                               )
         
         return self.scat, self.title, self.info_text
 
