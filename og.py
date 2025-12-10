@@ -14,25 +14,35 @@ FRICTION = 0.95
 SPAWN_RATE = 5
 
 # --- CROWD BEHAVIOR CONFIG ---
-COMPLIANCE_RATE = 0.65  # Only 65% of people will go to safe zones (the rest stay)
+COMPLIANCE_RATE = 0.65  # Only 65% of people will relocate to low-density zones
 CHILD_RATIO = 0.25     # 25% of agents will be children
-ADULT_SPEED = 2.0      # Max speed for adults
-CHILD_SPEED = 1.4      # Max speed for children
+ADULT_SPEED = 1.34      # Max speed for adults
+CHILD_SPEED = 1.05      # Max speed for children
 ADULT_SIZE = 50        
-CHILD_SIZE = 20        
+CHILD_SIZE = 20
+
+# --- DENSITY-BASED SLOWDOWN CONFIG ---
+DENSITY_RADIUS = 5.0    # Check density within this radius
+LOW_DENSITY_THRESHOLD = 3   # Less than 3 people nearby = free movement
+HIGH_DENSITY_THRESHOLD = 10  # More than 10 people nearby = significant slowdown
+MIN_SPEED_MULTIPLIER = 0.3   # Slowest speed is 30% of max speed
+
+# --- REAL-WORLD SCALING ---
+FLOOR_AREA_SQFT = 50000  # Real floor area
+SIMULATION_SCALE = 100   # Our simulation is 100x100 units
+SQFT_PER_UNIT = FLOOR_AREA_SQFT / (SIMULATION_SCALE ** 2)  # sq ft per simulation unit²
 
 # Harrods 4th Floor Boundary
 FLOOR_BOUNDARY = [
     (10, 10), (90, 10), (90, 95), (35, 90), (5, 65), (10, 10)
 ]
 
-# Safe Zones
-SAFE_ZONES = [
+# Low Density Zones (destinations for density reduction)
+LOW_DENSITY_ZONES = [
     {'x': 30, 'y': 45, 'w': 25, 'h': 25, 'name': 'Wellness Clinic', 'color': '#dcd0ff', 'capacity': 60},
     {'x': 8, 'y': 46, 'w': 12, 'h': 17, 'name': 'Burger Bar', 'color': '#d0ffdc', 'capacity': 35},
     {'x': 30, 'y': 70, 'w': 10, 'h': 10, 'name': 'Somewhere Cafe', 'color': "#c4ffe3", 'capacity': 20},
     {'x': 40, 'y': 70, 'w': 25, 'h': 20, 'name': 'Georgian Rest.', 'color': "#c4ffe3", 'capacity': 80},
-    # {'x': 65, 'y': 30, 'w': 23, 'h': 50, 'name': 'Childrenswear', 'color': '#ffe4c4', 'capacity': 100},
     {'x': 50, 'y': 12, 'w': 38, 'h': 15, 'name': 'Toys', 'color': '#c4f4ff', 'capacity': 80}
 ]
 
@@ -44,15 +54,10 @@ ENTRANCES = [
     {'pos': (85, 20), 'angle': np.pi, 'name': 'Brompton Esc.'}
 ]
 
-# High Density Shopping Areas (To avoid during invacuation)
+# High Density Shopping Areas
 HIGH_DENSITY_ZONES = [
-    # Women's Contemporary & Sport (Bottom Left - Pink)
     {'x': 15, 'y': 15, 'w': 35, 'h': 29}, 
-    
-    # Mini Superbrands (Center Right - Beige)
-    {'x': 50, 'y': 27, 'w': 15, 'h': 17} ,
-    
-    # Childrenswear (Right Side - Light Blue)
+    {'x': 50, 'y': 27, 'w': 15, 'h': 17},
     {'x': 65, 'y': 30, 'w': 23, 'h': 50}
 ]
 
@@ -63,24 +68,27 @@ class CrowdSimulation:
         self.pos = np.zeros((self.max_agents, 2))
         self.vel = np.zeros((self.max_agents, 2))
         
-        self.agent_types = np.zeros(self.max_agents, dtype=int) # 0=Adult, 1=Child
+        self.agent_types = np.zeros(self.max_agents, dtype=int)
         self.max_speeds = np.zeros(self.max_agents)
-        
-        # -1 implies NO target (staying put/shopping)
         self.target_zone = np.full(self.max_agents, -1, dtype=int)
+        self.parent_child_groups = {}  # Maps child index to parent index
         
-        self.reached_safety = np.zeros(self.max_agents, dtype=bool)
-        self.zone_counts = np.zeros(len(SAFE_ZONES), dtype=int)
-        self.initial_zone_visitors = np.zeros(self.max_agents, dtype=bool) # Track people who started in safe zones 
+        self.in_low_density_zone = np.zeros(self.max_agents, dtype=bool)
+        self.zone_counts = np.zeros(len(LOW_DENSITY_ZONES), dtype=int)
+        self.initial_zone_visitors = np.zeros(self.max_agents, dtype=bool)
         self.spawn_counter = 0
         self.invacuating = False
         
-        self.fig, self.ax = plt.subplots(figsize=(10, 10))
+        self.fig, self.ax = plt.subplots(figsize=(12, 10))
         self.setup_environment()
         
         self.scat = self.ax.scatter([], [], c='blue', s=[], alpha=0.7, edgecolors='navy', linewidth=0.5)
         self.title = self.ax.set_title("Harrods Floor 4 - Normal Operations", fontsize=14, fontweight='bold')
-        self.info_text = self.ax.text(12, 92, "", fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
+        self.info_text = self.ax.text(12, 92, "", fontsize=9, bbox=dict(facecolor='white', alpha=0.9))
+        
+        # Add simulation info text in bottom right
+        self.sim_info_text = self.ax.text(88, 6, "", fontsize=8, ha='right', va='bottom',
+                                          bbox=dict(facecolor='lightyellow', alpha=0.9, edgecolor='gray'))
 
     def setup_environment(self):
         self.ax.set_xlim(0, 100)
@@ -94,12 +102,12 @@ class CrowdSimulation:
         self.ax.add_patch(patch)
         self.floor_path = path
         
-        for zone in SAFE_ZONES:
+        for zone in LOW_DENSITY_ZONES:
             rect = patches.Rectangle((zone['x'], zone['y']), zone['w'], zone['h'], 
                                      facecolor=zone['color'], edgecolor='darkgreen', 
-                                     alpha=0.5, linewidth=2, linestyle='--')
+                                     alpha=0.4, linewidth=2, linestyle='--')
             self.ax.add_patch(rect)
-            self.ax.text(zone['x'] + zone['w']/2, zone['y'] + zone['h']/2, f"🛡️\n{zone['name']}", 
+            self.ax.text(zone['x'] + zone['w']/2, zone['y'] + zone['h']/2, f"🏪\n{zone['name']}", 
                          fontsize=8, color='darkgreen', fontweight='bold', ha='center', va='center')
         
         for i, zone in enumerate(HIGH_DENSITY_ZONES):
@@ -108,7 +116,6 @@ class CrowdSimulation:
                                      alpha=0.3, linewidth=2, linestyle=':')
             self.ax.add_patch(rect)
             
-            # Add labels
             if i == 0:
                 self.ax.text(zone['x'] + zone['w']/2, zone['y'] + zone['h']/2, 
                            "Women's\nContemporary\n& Sport", 
@@ -128,6 +135,25 @@ class CrowdSimulation:
             self.ax.text(entrance['pos'][0], entrance['pos'][1]-3.5, entrance['name'], 
                          fontsize=7, ha='center', color='#cc3333', fontweight='bold')
 
+    def calculate_local_density(self, agent_idx):
+        """Calculate how many people are near this agent"""
+        pos = self.pos[agent_idx]
+        diff = self.pos[:self.num_agents] - pos
+        distances = np.linalg.norm(diff, axis=1)
+        nearby = np.sum((distances < DENSITY_RADIUS) & (distances > 0.1))
+        return nearby
+
+    def get_density_speed_multiplier(self, nearby_count):
+        """Returns a speed multiplier based on local density (1.0 = full speed, 0.3 = slowest)"""
+        if nearby_count <= LOW_DENSITY_THRESHOLD:
+            return 1.0
+        elif nearby_count >= HIGH_DENSITY_THRESHOLD:
+            return MIN_SPEED_MULTIPLIER
+        else:
+            # Linear interpolation between thresholds
+            ratio = (nearby_count - LOW_DENSITY_THRESHOLD) / (HIGH_DENSITY_THRESHOLD - LOW_DENSITY_THRESHOLD)
+            return 1.0 - ratio * (1.0 - MIN_SPEED_MULTIPLIER)
+
     def get_nearest_valid_position(self, pos):
         center = np.array([50, 50])
         direction = center - pos
@@ -140,10 +166,10 @@ class CrowdSimulation:
         return center
 
     def assign_zone_balanced(self, person_idx):
-        utilization = self.zone_counts / np.array([z['capacity'] for z in SAFE_ZONES])
+        utilization = self.zone_counts / np.array([z['capacity'] for z in LOW_DENSITY_ZONES])
         person_pos = self.pos[person_idx]
         distances = []
-        for zone in SAFE_ZONES:
+        for zone in LOW_DENSITY_ZONES:
             zone_center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
             dist = np.linalg.norm(person_pos - zone_center)
             distances.append(dist)
@@ -165,57 +191,106 @@ class CrowdSimulation:
         if not self.floor_path.contains_point(new_pos):
             new_pos = self.get_nearest_valid_position(new_pos)
         
-        # Determine if child based on destination
+        # Determine if this will be a parent-child pair
+        spawn_with_child = False
         if destination_type == 'childrenswear':
-            # 70% chance of having a child in childrenswear area
-            is_child = np.random.random() < 0.7
-        elif destination_type == 'safe_zone':
-            # 20% chance of child for safe zones (restaurants/cafes)
-            is_child = np.random.random() < 0.2
-        else:
-            # Normal distribution for shopping areas
-            is_child = np.random.random() < CHILD_RATIO
+            # Always spawn parent-child pairs in childrenswear
+            spawn_with_child = True
+        elif destination_type == 'shopping':
+            # 25% chance of parent-child pair in general shopping
+            spawn_with_child = np.random.random() < 0.25
         
-        self.pos[self.num_agents] = new_pos
-        angle = entrance['angle'] + np.random.randn() * 0.3
-        
-        if is_child:
-            self.agent_types[self.num_agents] = 1
-            self.max_speeds[self.num_agents] = CHILD_SPEED
-            init_speed = np.random.uniform(0.4, 1.0)
-        else:
-            self.agent_types[self.num_agents] = 0
+        if spawn_with_child and self.num_agents < self.max_agents - 1:
+            # Spawn parent first
+            self.pos[self.num_agents] = new_pos
+            angle = entrance['angle'] + np.random.randn() * 0.3
+            
+            self.agent_types[self.num_agents] = 0  # Adult
             self.max_speeds[self.num_agents] = ADULT_SPEED
-            init_speed = np.random.uniform(0.7, 1.5)
-
-        self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
-        
-        # Handle safe zone visitors
-        if destination_type == 'safe_zone':
-            # Pick a random safe zone to visit
-            zone_idx = np.random.randint(0, len(SAFE_ZONES))
-            zone = SAFE_ZONES[zone_idx]
-            # Spawn directly in or near the safe zone
-            zone_pos = np.array([
-                zone['x'] + np.random.uniform(0.2, 0.8) * zone['w'],
-                zone['y'] + np.random.uniform(0.2, 0.8) * zone['h']
-            ])
-            self.pos[self.num_agents] = zone_pos
-            self.vel[self.num_agents] *= 0.2  # Move slowly in safe zones
-            self.initial_zone_visitors[self.num_agents] = True
-            self.reached_safety[self.num_agents] = True  # They're already in a safe zone
+            init_speed = np.random.uniform(0.5, 0.9)  # Parents walk slower with kids
+            self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
+            self.target_zone[self.num_agents] = -1
+            
+            parent_idx = self.num_agents
+            self.num_agents += 1
+            
+            # Spawn child next to parent
+            child_offset = np.random.randn(2) * 0.8
+            child_pos = new_pos + child_offset
+            if not self.floor_path.contains_point(child_pos):
+                child_pos = new_pos
+            
+            self.pos[self.num_agents] = child_pos
+            self.agent_types[self.num_agents] = 1  # Child
+            self.max_speeds[self.num_agents] = CHILD_SPEED * 0.85  # Children with parents walk slower
+            self.vel[self.num_agents] = self.vel[parent_idx] * 0.95  # Match parent velocity
+            self.target_zone[self.num_agents] = -1
+            
+            # Link child to parent
+            self.parent_child_groups[self.num_agents] = parent_idx
+            
+            self.num_agents += 1
         else:
-            self.target_zone[self.num_agents] = -1 
-        
-        self.num_agents += 1
+            # Spawn single adult (or single child in low-density zones)
+            if destination_type == 'low_density_zone':
+                is_child = np.random.random() < 0.2
+            else:
+                is_child = False  # Single shoppers are adults
+            
+            self.pos[self.num_agents] = new_pos
+            angle = entrance['angle'] + np.random.randn() * 0.3
+            
+            if is_child:
+                self.agent_types[self.num_agents] = 1
+                self.max_speeds[self.num_agents] = CHILD_SPEED
+                init_speed = np.random.uniform(0.4, 1.0)
+            else:
+                self.agent_types[self.num_agents] = 0
+                self.max_speeds[self.num_agents] = ADULT_SPEED
+                init_speed = np.random.uniform(0.7, 1.5)
+
+            self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
+            
+            if destination_type == 'low_density_zone':
+                zone_idx = np.random.randint(0, len(LOW_DENSITY_ZONES))
+                zone = LOW_DENSITY_ZONES[zone_idx]
+                zone_pos = np.array([
+                    zone['x'] + np.random.uniform(0.2, 0.8) * zone['w'],
+                    zone['y'] + np.random.uniform(0.2, 0.8) * zone['h']
+                ])
+                self.pos[self.num_agents] = zone_pos
+                self.vel[self.num_agents] *= 0.2
+                self.initial_zone_visitors[self.num_agents] = True
+                self.in_low_density_zone[self.num_agents] = True
+            else:
+                self.target_zone[self.num_agents] = -1 
+            
+            self.num_agents += 1
     
     def apply_forces(self):
         if self.num_agents == 0: return np.zeros((0, 2))
         forces = np.zeros((self.num_agents, 2))
         
+        # 0. Parent-child cohesion (keep families together)
+        for child_idx, parent_idx in self.parent_child_groups.items():
+            if child_idx >= self.num_agents or parent_idx >= self.num_agents:
+                continue
+            if self.in_low_density_zone[child_idx] or self.in_low_density_zone[parent_idx]:
+                continue
+                
+            # Pull child toward parent
+            diff = self.pos[parent_idx] - self.pos[child_idx]
+            dist = np.linalg.norm(diff)
+            if dist > 2.0:  # If child strays too far
+                forces[child_idx] += (diff / (dist + 0.01)) * 0.4
+            
+            # Slightly pull parent toward child (so they don't leave child behind)
+            if dist > 3.0:
+                forces[parent_idx] += (-diff / (dist + 0.01)) * 0.15
+        
         # 1. Separation
         for i in range(self.num_agents):
-            if self.reached_safety[i]: continue
+            if self.in_low_density_zone[i]: continue
             diff = self.pos[:self.num_agents] - self.pos[i]
             dist = np.linalg.norm(diff, axis=1)
             mask = (dist < NEIGHBOR_DIST) & (dist > 0.1)
@@ -224,30 +299,30 @@ class CrowdSimulation:
                 push = diff[mask] / dist[mask, None]
                 forces[i] -= np.sum(push * weights[:, None], axis=0) * SEPARATION_FORCE
         
-        # 2. Target Attraction (ONLY IF assigned a zone)
+        # 2. Target Attraction (calm, no urgency)
         if self.invacuating:
             for i in range(self.num_agents):
-                if self.reached_safety[i] or self.target_zone[i] == -1: 
+                if self.in_low_density_zone[i] or self.target_zone[i] == -1: 
                     continue
                 
-                zone = SAFE_ZONES[self.target_zone[i]]
+                zone = LOW_DENSITY_ZONES[self.target_zone[i]]
                 target = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
                 direction = target - self.pos[i]
                 dist = np.linalg.norm(direction)
                 
                 if dist > 1.0:
-                    urgency = 1.0 + (self.frame - 350) * 0.005
-                    forces[i] += (direction / dist) * TARGET_FORCE * urgency
+                    # No urgency multiplier - just calm redirection
+                    forces[i] += (direction / dist) * TARGET_FORCE * 0.8
                 
                 if (self.pos[i, 0] > zone['x'] and self.pos[i, 0] < zone['x'] + zone['w'] and
                     self.pos[i, 1] > zone['y'] and self.pos[i, 1] < zone['y'] + zone['h']):
-                    self.reached_safety[i] = True
-                    self.vel[i] *= 0.05
+                    self.in_low_density_zone[i] = True
+                    self.vel[i] *= 0.2  # Slow down in zone
         
-        # 3. High Density Avoidance (Only for evacuating people)
+        # 3. High Density Avoidance (Only for relocating people)
         if self.invacuating:
             for i in range(self.num_agents):
-                if self.reached_safety[i] or self.target_zone[i] == -1: 
+                if self.in_low_density_zone[i] or self.target_zone[i] == -1: 
                     continue
                 for zone in HIGH_DENSITY_ZONES:
                     center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
@@ -258,37 +333,39 @@ class CrowdSimulation:
 
         # 4. Shopping behavior - attraction to high density zones
         for i in range(self.num_agents):
-            # Skip people who started in safe zones - they stay put
             if self.initial_zone_visitors[i]:
                 continue
                 
-            # Apply to people who are staying (not evacuating)
             if not self.invacuating or self.target_zone[i] == -1:
-                if not self.reached_safety[i]:
-                    # Determine preferred shopping area based on whether they have children
-                    if self.agent_types[i] == 1:  # If this is a child
-                        # Children prefer childrenswear area
-                        target_zone = HIGH_DENSITY_ZONES[2]  # Childrenswear
+                if not self.in_low_density_zone[i]:
+                    # Check if this person is in a parent-child group
+                    is_child_with_parent = i in self.parent_child_groups
+                    is_parent = i in self.parent_child_groups.values()
+                    
+                    if is_child_with_parent or is_parent:
+                        # Families prefer childrenswear
+                        target_zone = HIGH_DENSITY_ZONES[2]
+                    elif self.agent_types[i] == 1:
+                        # Standalone children (shouldn't happen much) go to childrenswear
+                        target_zone = HIGH_DENSITY_ZONES[2]
                     else:
-                        # Adults without explicitly being with children prefer other areas
-                        # 60% women's wear, 30% mini superbrands, 10% childrenswear
+                        # Single adult shoppers
                         rand = np.random.random()
                         if rand < 0.6:
-                            target_zone = HIGH_DENSITY_ZONES[0]  # Women's Contemporary
+                            target_zone = HIGH_DENSITY_ZONES[0]
                         elif rand < 0.9:
-                            target_zone = HIGH_DENSITY_ZONES[1]  # Mini Superbrands
+                            target_zone = HIGH_DENSITY_ZONES[1]
                         else:
-                            target_zone = HIGH_DENSITY_ZONES[2]  # Childrenswear
+                            target_zone = HIGH_DENSITY_ZONES[2]
                     
                     center = np.array([target_zone['x'] + target_zone['w']/2, 
                                     target_zone['y'] + target_zone['h']/2])
                     direction = center - self.pos[i]
                     dist = np.linalg.norm(direction)
                     
-                    if dist > 5:  # Only attract if they're far away
+                    if dist > 5:
                         forces[i] += (direction / dist) * 0.15
                     
-                    # Add random wandering
                     forces[i] += (np.random.randn(2)) * 0.3
             
         return forces
@@ -296,14 +373,13 @@ class CrowdSimulation:
     def update(self, frame):
         self.frame = frame
         
-        # Phase 1: Shopping
-        if frame < 350:
+        # Phase 1: Shopping (continue spawning throughout)
+        if frame < 500:
             if frame % 2 == 0:
-                # 80% regular shoppers, 15% go to safe zones, 5% go to childrenswear
                 rand = np.random.random()
                 if rand < 0.15:
                     entrance_idx = np.random.randint(0, len(ENTRANCES))
-                    self.spawn_person(entrance_idx, 'safe_zone')
+                    self.spawn_person(entrance_idx, 'low_density_zone')
                 elif rand < 0.20:
                     entrance_idx = np.random.randint(0, len(ENTRANCES))
                     self.spawn_person(entrance_idx, 'childrenswear')
@@ -311,33 +387,38 @@ class CrowdSimulation:
                     entrance_idx = np.random.randint(0, len(ENTRANCES))
                     self.spawn_person(entrance_idx, 'shopping')
         
-        # Phase 2: Trigger Invacuation
+        # Phase 2: Trigger Density Reduction
         if frame == 350:
             self.invacuating = True
-            self.title.set_text("⚠️ PARTIAL INVACUATION (DENSITY REDUCTION) ⚠️")
-            self.title.set_color('red')
+            self.title.set_text("⚠️ DENSITY REDUCTION IN PROGRESS ⚠️")
+            self.title.set_color('orange')
             
-            # Select only a % of people to move
+            # Select only a % of people to relocate
             for i in range(self.num_agents):
-                # If random number is < compliance rate, they move. Else, they stay (-1)
-                if np.random.random() < COMPLIANCE_RATE:
+                if np.random.random() < COMPLIANCE_RATE and not self.initial_zone_visitors[i]:
                     self.target_zone[i] = self.assign_zone_balanced(i)
                 else:
-                    self.target_zone[i] = -1 # Explicitly set to stay
+                    self.target_zone[i] = -1  # Stay in current area
         
-        if self.num_agents == 0: return self.scat, self.title, self.info_text
+        if self.num_agents == 0: return self.scat, self.title, self.info_text, self.sim_info_text
         
         # Physics
         forces = self.apply_forces()
         self.vel[:self.num_agents] += forces
         self.vel[:self.num_agents] *= FRICTION
         
+        # Apply density-based speed limiting
         for i in range(self.num_agents):
             speed = np.linalg.norm(self.vel[i])
-            # People in safe zones move very slowly
             max_speed = self.max_speeds[i]
-            if self.initial_zone_visitors[i]:
-                max_speed *= 0.3
+            
+            if self.initial_zone_visitors[i] or self.in_low_density_zone[i]:
+                max_speed *= 0.3  # Move slowly in low-density zones
+            else:
+                # Apply density slowdown
+                nearby_count = self.calculate_local_density(i)
+                density_multiplier = self.get_density_speed_multiplier(nearby_count)
+                max_speed *= density_multiplier
             
             if speed > max_speed and speed > 0:
                 self.vel[i] = (self.vel[i] / speed) * max_speed
@@ -361,28 +442,40 @@ class CrowdSimulation:
             if self.agent_types[i] == 1: sizes.append(CHILD_SIZE)
             else: sizes.append(ADULT_SIZE)
 
-            if self.reached_safety[i]:
-                colors.append('#32CD32') # Safe (Green)
+            if self.in_low_density_zone[i]:
+                colors.append('#90EE90')  # Light green - in low density zone
             elif self.invacuating and self.target_zone[i] != -1:
-                colors.append('#FF4500') # Invacuating (Orange/Red)
+                colors.append('#FFA500')  # Orange - relocating
             else:
-                colors.append('#1E90FF') # Staying/Shopping (Blue)
+                colors.append('#1E90FF')  # Blue - staying/shopping
                 
         self.scat.set_offsets(self.pos[:self.num_agents])
         self.scat.set_color(colors)
         self.scat.set_sizes(sizes)
         
-        safe_count = np.sum(self.reached_safety[:self.num_agents])
+        relocated_count = np.sum(self.in_low_density_zone[:self.num_agents])
         staying_count = np.sum(self.target_zone[:self.num_agents] == -1)
+        relocating_count = self.num_agents - staying_count - relocated_count
         
-        self.info_text.set_text(f"Total: {self.num_agents}\nInvacuating: {self.num_agents - staying_count}\nStaying: {staying_count}\nSafe: {safe_count}")
+        # Calculate average density
+        total_density = sum(self.calculate_local_density(i) for i in range(self.num_agents))
+        avg_density = total_density / self.num_agents if self.num_agents > 0 else 0
         
-        return self.scat, self.title, self.info_text
+        self.info_text.set_text(f"Total: {self.num_agents}\nRelocating: {relocating_count}\n"
+                               f"Staying: {staying_count}\nIn Low-Density Zones: {relocated_count}\n"
+                               f"Avg Density: {avg_density:.1f}")
+        
+        # Update simulation info
+        sim_time_mins = frame / 30  # 30 frames per second
+        self.sim_info_text.set_text(f"Floor Area: {FLOOR_AREA_SQFT:,} sq ft\n"
+                                    f"Sim Time: {sim_time_mins:.1f} min\n"
+                                    f"⏩ Time-lapse view")
+        
+        return self.scat, self.title, self.info_text, self.sim_info_text
 
     def animate(self):
         anim = animation.FuncAnimation(self.fig, self.update, frames=600, 
                                        interval=30, blit=False, repeat=False)
-        # anim.save('crowd_simulation.gif', writer='ffmpeg', fps=30)
         plt.tight_layout()
         plt.show()
 
