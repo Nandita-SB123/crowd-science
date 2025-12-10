@@ -474,7 +474,7 @@ class CrowdSimulation:
         
         relocated_count = np.sum(self.in_low_density_zone[:self.num_agents])
         staying_count = np.sum(self.target_zone[:self.num_agents] == -1)
-        relocating_count = self.num_agents - staying_count - relocated_count
+        relocating_count = max(self.num_agents - staying_count - relocated_count, 0)
         
         # Calculate average density
         total_density = sum(self.calculate_local_density(i) for i in range(self.num_agents))
