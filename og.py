@@ -56,7 +56,7 @@ ENTRANCES = [
 
 # High Density Shopping Areas
 HIGH_DENSITY_ZONES = [
-    {'x': 15, 'y': 15, 'w': 35, 'h': 29}, 
+    {'x': 10, 'y': 15, 'w': 35, 'h': 29}, 
     {'x': 50, 'y': 27, 'w': 15, 'h': 17},
     {'x': 65, 'y': 30, 'w': 23, 'h': 50}
 ]
@@ -330,8 +330,27 @@ class CrowdSimulation:
                     dist = np.linalg.norm(diff)
                     if dist < 20:
                         forces[i] += (diff / (dist + 0.1)) * 0.15
-
-        # 4. Shopping behavior - attraction to high density zones
+                        
+        # 4. Low-density zone repulsion (keep shoppers OUT unless they spawned there)
+        for i in range(self.num_agents):
+            if self.initial_zone_visitors[i] or self.in_low_density_zone[i]:
+                continue  # Don't repel people who are supposed to be there
+            
+            # If not evacuating or not assigned to relocate, stay away from low-density zones
+            if not self.invacuating or self.target_zone[i] == -1:
+                for zone in LOW_DENSITY_ZONES:
+                    # Check if near or inside zone
+                    zone_center = np.array([zone['x'] + zone['w']/2, zone['y'] + zone['h']/2])
+                    diff = self.pos[i] - zone_center
+                    dist = np.linalg.norm(diff)
+                    
+                    # Repel if within zone boundaries or very close
+                    max_dist = np.sqrt(zone['w']**2 + zone['h']**2) / 2 + 3
+                    if dist < max_dist:
+                        repulsion_strength = 0.5 * (1.0 - dist / max_dist)
+                        forces[i] += (diff / (dist + 0.1)) * repulsion_strength
+        
+        # 5. Shopping behavior - attraction to high density zones
         for i in range(self.num_agents):
             if self.initial_zone_visitors[i]:
                 continue
