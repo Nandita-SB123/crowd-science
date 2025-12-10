@@ -79,6 +79,8 @@ class CrowdSimulation:
         self.spawn_counter = 0
         self.invacuating = False
         
+        self.risk_zone_history = []
+        
         self.fig, self.ax = plt.subplots(figsize=(12, 10))
         self.setup_environment()
         
@@ -393,7 +395,7 @@ class CrowdSimulation:
         self.frame = frame
         
         # Phase 1: Shopping (continue spawning throughout)
-        if frame < 500:
+        if frame < 350:
             if frame % 2 == 0:
                 rand = np.random.random()
                 if rand < 0.15:
@@ -405,6 +407,9 @@ class CrowdSimulation:
                 else:
                     entrance_idx = np.random.randint(0, len(ENTRANCES))
                     self.spawn_person(entrance_idx, 'shopping')
+                    
+        current_risk_count = self.count_people_in_risk_zones()
+        self.risk_zone_history.append(current_risk_count)
         
         # Phase 2: Trigger Density Reduction
         if frame == 350:
@@ -493,11 +498,58 @@ class CrowdSimulation:
         return self.scat, self.title, self.info_text, self.sim_info_text
 
     def animate(self):
-        anim = animation.FuncAnimation(self.fig, self.update, frames=600, 
+        anim = animation.FuncAnimation(self.fig, self.update, frames=500, 
                                        interval=30, blit=False, repeat=False)
+        plt.tight_layout()
+        plt.show()
+        
+    def count_people_in_risk_zones(self):
+        """Checks how many agents are currently inside High Density Zones"""
+        count = 0
+        for i in range(self.num_agents):
+            # Optional: Don't count people who have successfully evacuated to a safe zone
+            if self.in_low_density_zone[i]: 
+                continue
+                
+            px, py = self.pos[i]
+            in_zone = False
+            for zone in HIGH_DENSITY_ZONES:
+                # Check bounding box collision
+                if (px >= zone['x'] and px <= zone['x'] + zone['w'] and
+                    py >= zone['y'] and py <= zone['y'] + zone['h']):
+                    in_zone = True
+                    break
+            
+            if in_zone:
+                count += 1
+        return count
+    
+    def plot_risk_zone_analysis(self):
+        """Generates the occupancy graph after simulation or during updates"""
+        plt.figure(figsize=(12, 4))
+        
+        # Plot the recorded history
+        plt.plot(self.risk_zone_history, color='#e62e2e', linewidth=2, label='Occupancy in Risk Zone')
+        
+        # Add the trigger line at frame 350
+        plt.axvline(x=350, color='black', linestyle='--', linewidth=1.5, label='Invacuation Triggered')
+        
+        # Styling to match your screenshot
+        plt.title("Crowd Density in High-Risk Zone", fontsize=12)
+        plt.xlabel("Simulation Frame (Time)")
+        plt.ylabel("Number of People")
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='upper right')
+        
+        # Ensure the y-axis starts at 0 for clarity
+        plt.ylim(bottom=0)
+        
         plt.tight_layout()
         plt.show()
 
 if __name__ == "__main__":
     sim = CrowdSimulation()
     sim.animate()
+    # Once the animation window is closed, this will run:
+    print("Simulation finished. Generating analysis graph...")
+    sim.plot_risk_zone_analysis()
