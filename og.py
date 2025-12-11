@@ -4,33 +4,59 @@ import matplotlib.animation as animation
 from matplotlib.path import Path
 import matplotlib.patches as patches
 
+# --- REAL-WORLD SCALING ---
+FLOOR_AREA_SQFT = 50000  # Real floor area
+SIMULATION_SCALE = 100   # Our simulation is 100x100 units
+SQFT_PER_UNIT_SQUARED = FLOOR_AREA_SQFT / (SIMULATION_SCALE ** 2)  # sq ft per simulation unit²
+UNITS_PER_FOOT = SIMULATION_SCALE / np.sqrt(FLOOR_AREA_SQFT)  # ~0.447 units per foot
+
+# --- TIME SCALING ---
+FPS = 30  # Visual frame rate (milliseconds between frames)
+TIME_SCALE = 2.0  # Each frame represents 2 real seconds
+# This means: 500 frames = 1000 seconds = 16.7 minutes simulated time
+
+# --- REALISTIC MOVEMENT SPEEDS ---
+# Average walking speeds in feet per second
+REAL_ADULT_WALKING_SPEED = 4.5  # ft/s (typical adult)
+REAL_CHILD_WALKING_SPEED = 3.5  # ft/s (typical child)
+
+# Convert to simulation units per frame
+ADULT_SPEED = REAL_ADULT_WALKING_SPEED * UNITS_PER_FOOT * TIME_SCALE  # ~4.0 units/frame
+CHILD_SPEED = REAL_CHILD_WALKING_SPEED * UNITS_PER_FOOT * TIME_SCALE  # ~3.1 units/frame
+
+# --- REALISTIC DENSITY PARAMETERS ---
+# Personal space in real feet
+PERSONAL_SPACE_RADIUS_FT = 3.0  # feet - comfortable personal space
+NEIGHBOR_SPACE_FT = 2.0  # feet - collision avoidance distance
+
+# Convert to simulation units
+DENSITY_RADIUS = PERSONAL_SPACE_RADIUS_FT * UNITS_PER_FOOT  # ~1.34 units
+NEIGHBOR_DIST = NEIGHBOR_SPACE_FT * UNITS_PER_FOOT  # ~0.89 units
+
+# Density thresholds (people within DENSITY_RADIUS)
+LOW_DENSITY_THRESHOLD = 2   # 2 people within 3ft = comfortable
+HIGH_DENSITY_THRESHOLD = 8  # 8 people within 3ft = crowded
+
 # --- CONFIGURATION ---
 NUM_PEOPLE = 350
 SIM_SPEED = 1.0
-NEIGHBOR_DIST = 3.5
 SEPARATION_FORCE = 0.8
 TARGET_FORCE = 0.25
 FRICTION = 0.95
-SPAWN_RATE = 5
 
 # --- CROWD BEHAVIOR CONFIG ---
 COMPLIANCE_RATE = 0.65  # Only 65% of people will relocate to low-density zones
 CHILD_RATIO = 0.25     # 25% of agents will be children
-ADULT_SPEED = 1.34      # Max speed for adults
-CHILD_SPEED = 1.05      # Max speed for children
 ADULT_SIZE = 50        
 CHILD_SIZE = 20
 
 # --- DENSITY-BASED SLOWDOWN CONFIG ---
-DENSITY_RADIUS = 5.0    # Check density within this radius
-LOW_DENSITY_THRESHOLD = 3   # Less than 3 people nearby = free movement
-HIGH_DENSITY_THRESHOLD = 10  # More than 10 people nearby = significant slowdown
 MIN_SPEED_MULTIPLIER = 0.3   # Slowest speed is 30% of max speed
 
-# --- REAL-WORLD SCALING ---
-FLOOR_AREA_SQFT = 50000  # Real floor area
-SIMULATION_SCALE = 100   # Our simulation is 100x100 units
-SQFT_PER_UNIT = FLOOR_AREA_SQFT / (SIMULATION_SCALE ** 2)  # sq ft per simulation unit²
+# --- TIMELINE ---
+SHOPPING_PHASE_DURATION = 450  # frames (15 minutes simulated time)
+EVACUATION_TRIGGER_FRAME = 450
+TOTAL_SIMULATION_FRAMES = 900  # 30 minutes total
 
 # Harrods 4th Floor Boundary
 FLOOR_BOUNDARY = [
@@ -196,10 +222,8 @@ class CrowdSimulation:
         # Determine if this will be a parent-child pair
         spawn_with_child = False
         if destination_type == 'childrenswear':
-            # Always spawn parent-child pairs in childrenswear
             spawn_with_child = True
         elif destination_type == 'shopping':
-            # 25% chance of parent-child pair in general shopping
             spawn_with_child = np.random.random() < 0.25
         
         if spawn_with_child and self.num_agents < self.max_agents - 1:
@@ -209,7 +233,7 @@ class CrowdSimulation:
             
             self.agent_types[self.num_agents] = 0  # Adult
             self.max_speeds[self.num_agents] = ADULT_SPEED
-            init_speed = np.random.uniform(0.5, 0.9)  # Parents walk slower with kids
+            init_speed = np.random.uniform(0.5, 0.9) * ADULT_SPEED  # Parents walk slower with kids
             self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
             self.target_zone[self.num_agents] = -1
             
@@ -245,11 +269,11 @@ class CrowdSimulation:
             if is_child:
                 self.agent_types[self.num_agents] = 1
                 self.max_speeds[self.num_agents] = CHILD_SPEED
-                init_speed = np.random.uniform(0.4, 1.0)
+                init_speed = np.random.uniform(0.4, 1.0) * CHILD_SPEED
             else:
                 self.agent_types[self.num_agents] = 0
                 self.max_speeds[self.num_agents] = ADULT_SPEED
-                init_speed = np.random.uniform(0.7, 1.5)
+                init_speed = np.random.uniform(0.7, 1.0) * ADULT_SPEED
 
             self.vel[self.num_agents] = [np.cos(angle) * init_speed, np.sin(angle) * init_speed]
             
@@ -395,7 +419,7 @@ class CrowdSimulation:
         self.frame = frame
         
         # Phase 1: Shopping (continue spawning throughout)
-        if frame < 350:
+        if frame < SHOPPING_PHASE_DURATION:
             if frame % 2 == 0:
                 rand = np.random.random()
                 if rand < 0.15:
@@ -412,7 +436,7 @@ class CrowdSimulation:
         self.risk_zone_history.append(current_risk_count)
         
         # Phase 2: Trigger Density Reduction
-        if frame == 350:
+        if frame == EVACUATION_TRIGGER_FRAME:
             self.invacuating = True
             self.title.set_text("⚠️ DENSITY REDUCTION IN PROGRESS ⚠️")
             self.title.set_color('orange')
@@ -485,20 +509,29 @@ class CrowdSimulation:
         total_density = sum(self.calculate_local_density(i) for i in range(self.num_agents))
         avg_density = total_density / self.num_agents if self.num_agents > 0 else 0
         
+        # Calculate density per sq ft in risk zones
+        risk_zone_people = current_risk_count
+        risk_zone_area_sqft = sum(zone['w'] * zone['h'] * SQFT_PER_UNIT_SQUARED for zone in HIGH_DENSITY_ZONES)
+        density_per_sqft = risk_zone_people / risk_zone_area_sqft if risk_zone_area_sqft > 0 else 0
+        
         self.info_text.set_text(f"Total: {self.num_agents}\nRelocating: {relocating_count}\n"
                                f"Staying: {staying_count}\nIn Low-Density Zones: {relocated_count}\n"
-                               f"Avg Density: {avg_density:.1f}")
+                               f"Avg Nearby: {avg_density:.1f}\nRisk Zone Density: {density_per_sqft:.4f}/sqft")
         
-        # Update simulation info
-        sim_time_mins = frame / 30  # 30 frames per second
+        # Update simulation info with realistic time
+        sim_time_seconds = frame * TIME_SCALE
+        sim_time_mins = sim_time_seconds / 60
+        time_lapse_factor = TIME_SCALE
+        
         self.sim_info_text.set_text(f"Floor Area: {FLOOR_AREA_SQFT:,} sq ft\n"
                                     f"Sim Time: {sim_time_mins:.1f} min\n"
-                                    f"⏩ Time-lapse view")
+                                    f"Time-lapse: {time_lapse_factor:.0f}× speed\n"
+                                    f"Walking Speed: {REAL_ADULT_WALKING_SPEED:.1f} ft/s")
         
         return self.scat, self.title, self.info_text, self.sim_info_text
 
     def animate(self):
-        anim = animation.FuncAnimation(self.fig, self.update, frames=500, 
+        anim = animation.FuncAnimation(self.fig, self.update, frames=650, 
                                        interval=30, blit=False, repeat=False)
         plt.tight_layout()
         plt.show()
@@ -532,7 +565,7 @@ class CrowdSimulation:
         plt.plot(self.risk_zone_history, color='#e62e2e', linewidth=2, label='Occupancy in Risk Zone')
         
         # Add the trigger line at frame 350
-        plt.axvline(x=350, color='black', linestyle='--', linewidth=1.5, label='Invacuation Triggered')
+        plt.axvline(x=EVACUATION_TRIGGER_FRAME, color='black', linestyle='--', linewidth=1.5, label='Invacuation Triggered')
         
         # Styling to match your screenshot
         plt.title("Crowd Density in High-Risk Zone", fontsize=12)
